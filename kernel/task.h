@@ -38,8 +38,8 @@ struct task {
 
     struct sighand *sighand;
     sigset_t_ blocked;
-    sigset_t_ queued; // where blocked signals go when they're sent
     sigset_t_ pending;
+    struct list queue;
     cond_t pause; // please don't signal this
 
     // locked by pids_lock

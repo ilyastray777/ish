@@ -2,6 +2,8 @@
 #define SIGNAL_H
 
 #include "misc.h"
+#include "util/list.h"
+#include "util/sync.h"
 struct task;
 
 typedef qword_t sigset_t_;
@@ -9,6 +11,10 @@ typedef qword_t sigset_t_;
 #define SIG_ERR_ -1
 #define SIG_DFL_ 0
 #define SIG_IGN_ 1
+
+#define SA_SIGINFO_ 4
+#define SA_NODEFER_ 0x40000000
+
 struct sigaction_ {
     addr_t handler;
     dword_t flags;
@@ -51,16 +57,64 @@ struct sigaction_ {
 #define	SIGPWR_    30
 #define SIGSYS_    31
 
+#define SI_USER_ 0
+#define SI_TIMER_ -2
+#define SI_TKILL_ -6
+#define SI_KERNEL_ 128
+#define SEGV_MAPERR_ 1
+#define SEGV_ACCERR_ 2
+
+union sigval_ {
+    int_t sv_int;
+    addr_t sv_ptr;
+};
+
+struct siginfo_ {
+    int_t sig;
+    int_t sig_errno;
+    int_t code;
+    union {
+        struct {
+            pid_t_ pid;
+            uid_t_ uid;
+        } kill;
+        struct {
+            pid_t_ pid;
+            uid_t_ uid;
+            int_t status;
+            clock_t_ utime;
+            clock_t_ stime;
+        } child;
+        struct {
+            addr_t addr;
+        } fault;
+        struct {
+            addr_t addr;
+            int_t syscall;
+        } sigsys;
+    };
+};
+
+// a reasonable default siginfo
+static const struct siginfo_ SIGINFO_NIL = {
+    .code = SI_KERNEL_,
+};
+
+struct sigqueue {
+    struct list queue;
+    struct siginfo_ info;
+};
+
 // send a signal
 // you better make sure the task isn't gonna get freed under me (pids_lock or current)
-void send_signal(struct task *task, int sig);
+void send_signal(struct task *task, int sig, struct siginfo_ info);
 // send a signal without regard for whether the signal is blocked or ignored
-void deliver_signal(struct task *task, int sig);
+void deliver_signal(struct task *task, int sig, struct siginfo_ info);
 // send a signal to current if it's not blocked or ignored, return whether that worked
 // exists specifically for sending SIGTTIN/SIGTTOU
 bool try_self_signal(int sig);
 // send a signal to all processes in a group, could return ESRCH
-int send_group_signal(dword_t pgid, int sig);
+int send_group_signal(dword_t pgid, int sig, struct siginfo_ info);
 // check for and deliver pending signals on current
 // returns whether signals were received
 // must be called without pids_lock
@@ -71,7 +125,6 @@ struct sighand {
     struct sigaction_ action[NUM_SIGS];
     addr_t altstack;
     dword_t altstack_size;
-    bool on_altstack;
     lock_t lock;
 };
 struct sighand *sighand_new(void);
@@ -81,6 +134,7 @@ void sighand_release(struct sighand *sighand);
 dword_t sys_rt_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_addr, dword_t sigset_size);
 dword_t sys_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_addr);
 dword_t sys_rt_sigreturn(dword_t sig);
+dword_t sys_sigreturn(dword_t sig);
 
 #define SIG_BLOCK_ 0
 #define SIG_UNBLOCK_ 1
@@ -90,6 +144,21 @@ int do_sigprocmask(dword_t how, sigset_t_ set, sigset_t_ *oldset);
 dword_t sys_rt_sigprocmask(dword_t how, addr_t set, addr_t oldset, dword_t size);
 int_t sys_rt_sigpending(addr_t set_addr);
 
+static inline sigset_t_ sig_mask(int sig) {
+    assert(sig >= 1 && sig <= NUM_SIGS);
+    return 1l << (sig - 1);
+}
+
+static inline bool sigset_has(sigset_t_ set, int sig) {
+    return !!(set & sig_mask(sig));
+}
+static inline void sigset_add(sigset_t_ *set, int sig) {
+    *set |= sig_mask(sig);
+}
+static inline void sigset_del(sigset_t_ *set, int sig) {
+    *set &= ~sig_mask(sig);
+}
+
 struct stack_t_ {
     addr_t stack;
     dword_t flags;
@@ -97,6 +166,7 @@ struct stack_t_ {
 };
 #define SS_ONSTACK_ 1
 #define SS_DISABLE_ 2
+#define MINSIGSTKSZ_ 2048
 dword_t sys_sigaltstack(addr_t ss, addr_t old_ss);
 
 int_t sys_rt_sigsuspend(addr_t mask_addr, uint_t size);
@@ -134,6 +204,14 @@ struct sigcontext_ {
     dword_t oldmask;
     dword_t cr2;
 };
+
+struct ucontext_ {
+    uint_t flags;
+    uint_t link;
+    struct stack_t_ stack;
+    struct sigcontext_ mcontext;
+    sigset_t_ sigmask;
+} __attribute__((packed));
 
 struct fpreg_ {
     word_t significand[4];
@@ -173,16 +251,25 @@ struct fpstate_ {
 };
 
 struct sigframe_ {
-    addr_t pretcode;
+    addr_t restorer;
     dword_t sig;
     struct sigcontext_ sc;
     struct fpstate_ fpstate;
     dword_t extramask;
-    struct {
-        uint16_t popmov;
-        dword_t nr_sigreturn;
-        uint16_t int80;
-    } __attribute__((packed)) retcode;
+    char retcode[8];
+};
+
+struct rt_sigframe_ {
+    addr_t restorer;
+    int_t sig;
+    addr_t pinfo;
+    addr_t puc;
+    union {
+        struct siginfo_ info;
+        char __pad[128];
+    };
+    struct ucontext_ uc;
+    char retcode[8];
 };
 
 // On a 64-bit system with 32-bit emulation, the fpu state is stored in extra

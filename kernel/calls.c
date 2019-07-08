@@ -79,6 +79,7 @@ syscall_t syscall_table[] = {
     [114] = (syscall_t) sys_wait4,
     [116] = (syscall_t) sys_sysinfo,
     [118] = (syscall_t) sys_fsync,
+    [119] = (syscall_t) sys_sigreturn,
     [120] = (syscall_t) sys_clone,
     [122] = (syscall_t) sys_uname,
     [125] = (syscall_t) sys_mprotect,
@@ -88,6 +89,7 @@ syscall_t syscall_table[] = {
     [141] = (syscall_t) sys_getdents,
     [142] = (syscall_t) sys_select,
     [143] = (syscall_t) sys_flock,
+    [144] = (syscall_t) sys_msync,
     [145] = (syscall_t) sys_readv,
     [146] = (syscall_t) sys_writev,
     [147] = (syscall_t) sys_getsid,
@@ -178,6 +180,7 @@ syscall_t syscall_table[] = {
     [324] = (syscall_t) sys_fallocate,
     [328] = (syscall_t) sys_eventfd2,
     [329] = (syscall_t) sys_epoll_create,
+    [330] = (syscall_t) sys_dup3,
     [331] = (syscall_t) sys_pipe2,
     [340] = (syscall_t) sys_prlimit64,
     [345] = (syscall_t) sys_sendmmsg,
@@ -211,7 +214,7 @@ void handle_interrupt(int interrupt) {
         unsigned syscall_num = cpu->eax;
         if (syscall_num >= NUM_SYSCALLS || syscall_table[syscall_num] == NULL) {
             printk("%d missing syscall %d\n", current->pid, syscall_num);
-            send_signal(current, SIGSYS_);
+            deliver_signal(current, SIGSYS_, SIGINFO_NIL);
         } else {
             STRACE("%d call %-3d ", current->pid, syscall_num);
             int result = syscall_table[syscall_num](cpu->ebx, cpu->ecx, cpu->edx, cpu->esi, cpu->edi, cpu->ebp);
@@ -220,7 +223,11 @@ void handle_interrupt(int interrupt) {
         }
     } else if (interrupt == INT_GPF) {
         printk("%d page fault on 0x%x at 0x%x\n", current->pid, cpu->segfault_addr, cpu->eip);
-        deliver_signal(current, SIGSEGV_);
+        struct siginfo_ info = {
+            .code = mem_segv_reason(cpu->mem, cpu->segfault_addr, cpu->segfault_type),
+            .fault.addr = cpu->segfault_addr,
+        };
+        deliver_signal(current, SIGSEGV_, info);
     } else if (interrupt == INT_UNDEFINED) {
         printk("%d illegal instruction at 0x%x: ", current->pid, cpu->eip);
         for (int i = 0; i < 8; i++) {
@@ -230,7 +237,11 @@ void handle_interrupt(int interrupt) {
             printk("%02x ", b);
         }
         printk("\n");
-        deliver_signal(current, SIGILL_);
+        struct siginfo_ info = {
+            .code = SI_KERNEL_,
+            .fault.addr = cpu->eip,
+        };
+        deliver_signal(current, SIGILL_, info);
     } else if (interrupt != INT_TIMER) {
         printk("%d unhandled interrupt %d\n", current->pid, interrupt);
         sys_exit(interrupt);

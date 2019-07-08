@@ -4,14 +4,19 @@
 #include "kernel/calls.h"
 #include "kernel/signal.h"
 #include "kernel/vdso.h"
+#include "emu/interrupt.h"
 
 int xsave_extra = 0;
 int fxsave_extra = 0;
 static int do_sigprocmask_unlocked(dword_t how, sigset_t_ set, sigset_t_ *oldset_out);
+static void altstack_to_user(struct sighand *sighand, struct stack_t_ *user_stack);
+static bool is_on_altstack(dword_t sp, struct sighand *sighand);
 
 static int signal_is_blockable(int sig) {
     return sig != SIGKILL_ && sig != SIGSTOP_;
 }
+
+#define UNBLOCKABLE_MASK (sig_mask(SIGKILL_) | sig_mask(SIGSTOP_))
 
 #define SIGNAL_IGNORE 0
 #define SIGNAL_KILL 1
@@ -40,8 +45,19 @@ static int signal_action(struct sighand *sighand, int sig) {
     }
 }
 
-static void deliver_signal_unlocked(struct task *task, int sig) {
-    task->pending |= 1l << sig;
+static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ info) {
+    if (sigset_has(task->pending, sig))
+        return;
+
+    sigset_add(&task->pending, sig);
+    struct sigqueue *sigqueue = malloc(sizeof(struct sigqueue));
+    sigqueue->info = info;
+    sigqueue->info.sig = sig;
+    list_add_tail(&task->queue, &sigqueue->queue);
+
+    if (sigset_has(task->blocked, sig) && signal_is_blockable(sig))
+        return;
+
     if (task != current) {
         // actual madness, I hope to god it's correct
 retry:
@@ -65,13 +81,13 @@ retry:
     }
 }
 
-void deliver_signal(struct task *task, int sig) {
+void deliver_signal(struct task *task, int sig, struct siginfo_ info) {
     lock(&task->sighand->lock);
-    deliver_signal_unlocked(task, sig);
+    deliver_signal_unlocked(task, sig, info);
     unlock(&task->sighand->lock);
 }
 
-void send_signal(struct task *task, int sig) {
+void send_signal(struct task *task, int sig, struct siginfo_ info) {
     // signal zero is for testing whether a process exists
     if (sig == 0)
         return;
@@ -81,10 +97,7 @@ void send_signal(struct task *task, int sig) {
     struct sighand *sighand = task->sighand;
     lock(&sighand->lock);
     if (signal_action(sighand, sig) != SIGNAL_IGNORE) {
-        if (task->blocked & (1l << sig) && signal_is_blockable(sig))
-            task->queued |= (1l << sig);
-        else
-            deliver_signal_unlocked(task, sig);
+        deliver_signal_unlocked(task, sig, info);
     }
     unlock(&sighand->lock);
 
@@ -97,17 +110,19 @@ void send_signal(struct task *task, int sig) {
 }
 
 bool try_self_signal(int sig) {
+    assert(sig == SIGTTIN_ || sig == SIGTTOU_);
+
     struct sighand *sighand = current->sighand;
     lock(&sighand->lock);
     bool can_send = signal_action(sighand, sig) != SIGNAL_IGNORE &&
-        !(current->blocked & (1l << sig));
+        !sigset_has(current->blocked, sig);
     if (can_send)
-        deliver_signal_unlocked(current, sig);
+        deliver_signal_unlocked(current, sig, SIGINFO_NIL);
     unlock(&sighand->lock);
     return can_send;
 }
 
-int send_group_signal(dword_t pgid, int sig) {
+int send_group_signal(dword_t pgid, int sig, struct siginfo_ info) {
     lock(&pids_lock);
     struct pid *pid = pid_get(pgid);
     if (pid == NULL) {
@@ -116,15 +131,84 @@ int send_group_signal(dword_t pgid, int sig) {
     }
     struct tgroup *tgroup;
     list_for_each_entry(&pid->pgroup, tgroup, pgroup) {
-        send_signal(tgroup->leader, sig);
+        send_signal(tgroup->leader, sig, info);
     }
     unlock(&pids_lock);
     return 0;
 }
 
-static void receive_signal(struct sighand *sighand, int sig) {
+static addr_t sigreturn_trampoline(const char *name) {
+    addr_t sigreturn_addr = vdso_symbol(name);
+    if (sigreturn_addr == 0) {
+        die("sigreturn not found in vdso, this should never happen");
+    }
+    return current->mm->vdso + sigreturn_addr;
+}
+
+static void setup_sigcontext(struct sigcontext_ *sc, struct cpu_state *cpu) {
+    sc->ax = cpu->eax;
+    sc->bx = cpu->ebx;
+    sc->cx = cpu->ecx;
+    sc->dx = cpu->edx;
+    sc->di = cpu->edi;
+    sc->si = cpu->esi;
+    sc->bp = cpu->ebp;
+    sc->sp = sc->sp_at_signal = cpu->esp;
+    sc->ip = cpu->eip;
+    collapse_flags(cpu);
+    sc->flags = cpu->eflags;
+    sc->trapno = cpu->trapno;
+    if (cpu->trapno == INT_GPF)
+        sc->cr2 = cpu->segfault_addr;
+    // TODO more shit
+    sc->oldmask = current->blocked & 0xffffffff;
+}
+
+static void setup_sigframe(struct siginfo_ *info, struct sigframe_ *frame) {
+    frame->restorer = sigreturn_trampoline("__kernel_sigreturn");
+    frame->sig = info->sig;
+    setup_sigcontext(&frame->sc, &current->cpu);
+    frame->extramask = current->blocked >> 32;
+
+    static const struct {
+        uint16_t popmov;
+        uint32_t nr_sigreturn;
+        uint16_t int80;
+    } __attribute__((packed)) retcode = {
+        .popmov = 0xb858,
+        .nr_sigreturn = 113,
+        .int80 = 0x80cd,
+    };
+    memcpy(frame->retcode, &retcode, sizeof(retcode));
+}
+
+static void setup_rt_sigframe(struct siginfo_ *info, struct rt_sigframe_ *frame) {
+    frame->restorer = sigreturn_trampoline("__kernel_rt_sigreturn");
+    frame->sig = info->sig;
+    frame->info = *info;
+    frame->uc.flags = 0;
+    frame->uc.link = 0;
+    altstack_to_user(current->sighand, &frame->uc.stack);
+    setup_sigcontext(&frame->uc.mcontext, &current->cpu);
+    frame->uc.sigmask = current->blocked;
+
+    static const struct {
+        uint8_t mov;
+        uint32_t nr_rt_sigreturn;
+        uint16_t int80;
+        uint8_t pad;
+    } __attribute__((packed)) rt_retcode = {
+        .mov = 0xb8,
+        .nr_rt_sigreturn = 173,
+        .int80 = 0x80cd,
+    };
+    memcpy(frame->retcode, &rt_retcode, sizeof(rt_retcode));
+}
+
+static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
+    int sig = info->sig;
     STRACE("%d receiving signal %d\n", current->pid, sig);
-    current->pending &= ~(1l << sig);
+    sigset_del(&current->pending, sig);
 
     switch (signal_action(sighand, sig)) {
         case SIGNAL_IGNORE:
@@ -142,45 +226,30 @@ static void receive_signal(struct sighand *sighand, int sig) {
             do_exit_group(sig);
     }
 
+    struct sigaction_ *action = &sighand->action[info->sig];
+    bool need_siginfo = action->flags & SA_SIGINFO_;
+
     // setup the frame
-    struct sigframe_ frame = {};
-    frame.sig = sig;
-    frame.sc.oldmask = current->blocked & 0xffffffff;
-    frame.extramask = current->blocked >> 32;
-
-    struct cpu_state *cpu = &current->cpu;
-    frame.sc.ax = cpu->eax;
-    frame.sc.bx = cpu->ebx;
-    frame.sc.cx = cpu->ecx;
-    frame.sc.dx = cpu->edx;
-    frame.sc.di = cpu->edi;
-    frame.sc.si = cpu->esi;
-    frame.sc.bp = cpu->ebp;
-    frame.sc.sp = frame.sc.sp_at_signal = cpu->esp;
-    frame.sc.ip = cpu->eip;
-    collapse_flags(cpu);
-    frame.sc.flags = cpu->eflags;
-    frame.sc.trapno = cpu->trapno;
-    // TODO more shit
-
-    addr_t sigreturn_addr = vdso_symbol("__kernel_rt_sigreturn");
-    if (sigreturn_addr == 0) {
-        die("sigreturn not found in vdso, this should never happen");
+    union {
+        struct sigframe_ sigframe;
+        struct rt_sigframe_ rt_sigframe;
+    } frame = {};
+    size_t frame_size;
+    if (need_siginfo) {
+        setup_rt_sigframe(info, &frame.rt_sigframe);
+        frame_size = sizeof(frame.rt_sigframe);
+    } else {
+        setup_sigframe(info, &frame.sigframe);
+        frame_size = sizeof(frame.sigframe);
     }
-    frame.pretcode = current->mm->vdso + sigreturn_addr;
-    // for legacy purposes
-    frame.retcode.popmov = 0xb858;
-    frame.retcode.nr_sigreturn = 173; // rt_sigreturn
-    frame.retcode.int80 = 0x80cd;
 
     // set up registers for signal handler
-    cpu->eax = sig;
-    cpu->eip = sighand->action[sig].handler;
+    current->cpu.eax = info->sig;
+    current->cpu.eip = sighand->action[info->sig].handler;
 
-    dword_t sp = cpu->esp;
+    dword_t sp = current->cpu.esp;
     if (sighand->altstack) {
         sp = sighand->altstack + sighand->altstack_size;
-        sighand->on_altstack = true;
     }
     if (xsave_extra) {
         // do as the kernel does
@@ -190,18 +259,29 @@ static void receive_signal(struct sighand *sighand, int sig) {
         sp &=~ 0x3f;
         sp -= fxsave_extra;
     }
-    sp -= sizeof(struct sigframe_);
+    sp -= frame_size;
     // align sp + 4 on a 16-byte boundary because that's what the abi says
     sp = ((sp + 4) & ~0xf) - 4;
-    cpu->esp = sp;
+    current->cpu.esp = sp;
 
-    // block the signal while running the handler
-    current->blocked |= (1l << sig);
+    // Update the mask. By default the signal will be blocked while in the
+    // handler, but sigaction is allowed to customize this.
+    if (!(action->flags & SA_NODEFER_))
+        sigset_add(&current->blocked, info->sig);
+    current->blocked |= action->mask;
+
+    // these have to be filled in after the location of the frame is known
+    if (need_siginfo) {
+        frame.rt_sigframe.pinfo = sp + offsetof(struct rt_sigframe_, info);
+        frame.rt_sigframe.puc = sp + offsetof(struct rt_sigframe_, uc);
+        current->cpu.edx = frame.rt_sigframe.pinfo;
+        current->cpu.ecx = frame.rt_sigframe.puc;
+    }
 
     // install frame
-    // nothing we can do if this fails
+    (void) user_write(sp, &frame, frame_size);
+    // nothing we can do if that fails
     // TODO do something other than nothing, like printk maybe
-    (void) user_put(sp, frame);
 }
 
 bool receive_signals() {
@@ -209,13 +289,17 @@ bool receive_signals() {
     bool was_stopped = current->group->stopped;
     unlock(&current->group->lock);
 
+    bool received_any = false;
     struct sighand *sighand = current->sighand;
     lock(&sighand->lock);
-    bool any_left = current->pending != 0;
-    if (any_left) {
-        for (int sig = 0; sig < NUM_SIGS; sig++)
-            if (current->pending & (1l << sig))
-                receive_signal(sighand, sig);
+    struct sigqueue *sigqueue, *tmp;
+    list_for_each_entry_safe(&current->queue, sigqueue, tmp, queue) {
+        if (sigset_has(current->blocked, sigqueue->info.sig))
+            continue;
+        list_remove(&sigqueue->queue);
+        receive_signal(sighand, &sigqueue->info);
+        free(sigqueue);
+        received_any = true;
     }
     unlock(&sighand->lock);
 
@@ -227,12 +311,64 @@ bool receive_signals() {
         if (now_stopped) {
             lock(&pids_lock);
             notify(&current->parent->group->child_exit);
-            send_signal(current->parent, current->group->leader->exit_signal);
+            // TODO add siginfo
+            send_signal(current->parent, current->group->leader->exit_signal, SIGINFO_NIL);
             unlock(&pids_lock);
         }
     }
 
-    return any_left;
+    return received_any;
+}
+
+static void restore_sigcontext(struct sigcontext_ *context, struct cpu_state *cpu) {
+    cpu->eax = context->ax;
+    cpu->ebx = context->bx;
+    cpu->ecx = context->cx;
+    cpu->edx = context->dx;
+    cpu->edi = context->di;
+    cpu->esi = context->si;
+    cpu->ebp = context->bp;
+    cpu->esp = context->sp;
+    cpu->eip = context->ip;
+    collapse_flags(cpu);
+
+    // Use AC, RF, OF, DF, TF, SF, ZF, AF, PF, CF
+#define USE_FLAGS 0b1010000110111010101
+    cpu->eflags = (context->flags & USE_FLAGS) | (cpu->eflags & ~USE_FLAGS);
+}
+
+dword_t sys_rt_sigreturn() {
+    struct cpu_state *cpu = &current->cpu;
+    struct rt_sigframe_ frame;
+    // esp points past the first field of the frame
+    (void) user_get(cpu->esp - offsetof(struct rt_sigframe_, sig), frame);
+    restore_sigcontext(&frame.uc.mcontext, cpu);
+
+    lock(&current->sighand->lock);
+    // FIXME this duplicates logic from sys_sigaltstack
+    if (!is_on_altstack(cpu->esp, current->sighand) &&
+            frame.uc.stack.size >= MINSIGSTKSZ_) {
+        current->sighand->altstack = frame.uc.stack.stack;
+        current->sighand->altstack_size = frame.uc.stack.size;
+    }
+    do_sigprocmask_unlocked(SIG_SETMASK_, frame.uc.sigmask, NULL);
+    unlock(&current->sighand->lock);
+    return cpu->eax;
+}
+
+dword_t sys_sigreturn() {
+    struct cpu_state *cpu = &current->cpu;
+    struct sigframe_ frame;
+    // esp points past the first two fields of the frame
+    (void) user_get(cpu->esp - offsetof(struct sigframe_, sc), frame);
+    // TODO check for errors in that
+    restore_sigcontext(&frame.sc, cpu);
+
+    lock(&current->sighand->lock);
+    sigset_t_ oldmask = ((sigset_t_) frame.extramask << 32) | frame.sc.oldmask;
+    do_sigprocmask_unlocked(SIG_SETMASK_, oldmask, NULL);
+    unlock(&current->sighand->lock);
+    return cpu->eax;
 }
 
 struct sighand *sighand_new() {
@@ -257,34 +393,6 @@ void sighand_release(struct sighand *sighand) {
     if (--sighand->refcount == 0) {
         free(sighand);
     }
-}
-
-dword_t sys_rt_sigreturn(dword_t UNUSED(sig)) {
-    struct cpu_state *cpu = &current->cpu;
-    struct sigframe_ frame;
-    // skip the first two fields of the frame
-    // the return address was popped by the ret instruction
-    // the signal number was popped into ebx and passed as an argument
-    (void) user_get(cpu->esp - offsetof(struct sigframe_, sc), frame);
-    // TODO check for errors in that
-    cpu->eax = frame.sc.ax;
-    cpu->ebx = frame.sc.bx;
-    cpu->ecx = frame.sc.cx;
-    cpu->edx = frame.sc.dx;
-    cpu->edi = frame.sc.di;
-    cpu->esi = frame.sc.si;
-    cpu->ebp = frame.sc.bp;
-    cpu->esp = frame.sc.sp;
-    cpu->eip = frame.sc.ip;
-    collapse_flags(cpu);
-    cpu->eflags = frame.sc.flags;
-
-    lock(&current->sighand->lock);
-    current->sighand->on_altstack = false;
-    sigset_t_ oldmask = ((sigset_t_) frame.extramask << 32) | frame.sc.oldmask;
-    do_sigprocmask_unlocked(SIG_SETMASK_, oldmask, NULL);
-    unlock(&current->sighand->lock);
-    return cpu->eax;
 }
 
 static int do_sigaction(int sig, const struct sigaction_ *action, struct sigaction_ *oldaction) {
@@ -339,15 +447,7 @@ static int do_sigprocmask_unlocked(dword_t how, sigset_t_ set, sigset_t_ *oldset
         current->blocked = set;
     else
         return _EINVAL;
-
-    // transfer unblocked signals from queued to pending
-    sigset_t_ unblocked = oldset & ~current->blocked;
-    current->pending |= current->queued & unblocked;
-    current->queued &= ~unblocked;
-    // transfer blocked signals from pending to queued
-    sigset_t_ blocked = current->blocked & ~oldset;
-    current->queued |= current->pending & blocked;
-    current->pending &= ~blocked;
+    current->blocked &= ~UNBLOCKABLE_MASK;
 
     if (oldset_out != NULL)
         *oldset_out = oldset;
@@ -389,9 +489,25 @@ dword_t sys_rt_sigprocmask(dword_t how, addr_t set_addr, addr_t oldset_addr, dwo
 
 int_t sys_rt_sigpending(addr_t set_addr) {
     STRACE("rt_sigpending(%#x)");
-    if (user_put(set_addr, current->pending))
+    // as defined by the standard
+    sigset_t_ pending = current->pending & current->blocked;
+    if (user_put(set_addr, pending))
         return _EFAULT;
     return 0;
+}
+
+static bool is_on_altstack(dword_t sp, struct sighand *sighand) {
+    return sp > sighand->altstack && sp <= sighand->altstack + sighand->altstack_size;
+}
+
+static void altstack_to_user(struct sighand *sighand, struct stack_t_ *user_stack) {
+    user_stack->stack = sighand->altstack;
+    user_stack->size = sighand->altstack_size;
+    user_stack->flags = 0;
+    if (sighand->altstack == 0)
+        user_stack->flags |= SS_DISABLE_;
+    if (is_on_altstack(current->cpu.esp, sighand))
+        user_stack->flags |= SS_ONSTACK_;
 }
 
 dword_t sys_sigaltstack(addr_t ss_addr, addr_t old_ss_addr) {
@@ -400,20 +516,14 @@ dword_t sys_sigaltstack(addr_t ss_addr, addr_t old_ss_addr) {
     lock(&sighand->lock);
     if (old_ss_addr != 0) {
         struct stack_t_ old_ss;
-        old_ss.stack = sighand->altstack;
-        old_ss.size = sighand->altstack_size;
-        old_ss.flags = 0;
-        if (sighand->altstack == 0)
-            old_ss.flags |= SS_DISABLE_;
-        if (sighand->on_altstack)
-            old_ss.flags |= SS_ONSTACK_;
+        altstack_to_user(sighand, &old_ss);
         if (user_put(old_ss_addr, old_ss)) {
             unlock(&sighand->lock);
             return _EFAULT;
         }
     }
     if (ss_addr != 0) {
-        if (sighand->on_altstack) {
+        if (is_on_altstack(current->cpu.esp, sighand)) {
             unlock(&sighand->lock);
             return _EPERM;
         }
@@ -425,6 +535,8 @@ dword_t sys_sigaltstack(addr_t ss_addr, addr_t old_ss_addr) {
         if (ss.flags & SS_DISABLE_) {
             sighand->altstack = 0;
         } else {
+            if (ss.size < MINSIGSTKSZ_)
+                return _ENOMEM;
             sighand->altstack = ss.stack;
             sighand->altstack_size = ss.size;
         }
@@ -439,14 +551,16 @@ int_t sys_rt_sigsuspend(addr_t mask_addr, uint_t size) {
     sigset_t_ mask, oldmask;
     if (user_get(mask_addr, mask))
         return _EFAULT;
-    STRACE("sigsuspend(0x%llx)\n", (long long) mask);
+    STRACE("sigsuspend(0x%llx) = ...\n", (long long) mask);
 
     lock(&current->sighand->lock);
     do_sigprocmask_unlocked(SIG_SETMASK_, mask, &oldmask);
-    while (!current->pending)
+    while (!(current->pending & ~current->blocked)) {
         wait_for(&current->pause, &current->sighand->lock, NULL);
+    }
     do_sigprocmask_unlocked(SIG_SETMASK_, oldmask, NULL);
     unlock(&current->sighand->lock);
+    STRACE("%d done sigsuspend", current->pid);
     return _EINTR;
 }
 
@@ -462,11 +576,16 @@ int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid) {
     STRACE("kill(%d, %d)", pid, sig);
     if (sig >= NUM_SIGS)
         return _EINVAL;
+    struct siginfo_ info = {
+        .code = SI_USER_,
+        .kill.pid = current->pid,
+        .kill.uid = current->uid,
+    };
     // TODO check permissions
     if (pid == 0)
         pid = -current->group->pgid;
     if (pid < 0)
-        return send_group_signal(-pid, sig);
+        return send_group_signal(-pid, sig, info);
 
     lock(&pids_lock);
     struct task *task = pid_get_task(pid);
@@ -481,7 +600,7 @@ int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid) {
         return _ESRCH;
     }
 
-    send_signal(task, sig);
+    send_signal(task, sig, info);
     unlock(&pids_lock);
     return 0;
 }
